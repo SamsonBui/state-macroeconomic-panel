@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-build_state_datasets_v1.py
+build_state_datasets.py
 ─────────────────────────────────────────────────────────────────────────────
 Build all state-level economic datasets for the 27 target states.
 
@@ -20,7 +20,7 @@ HTTP downloads use Scrapling (curl_cffi browser impersonation) to avoid FRED
 Akamai blocks on plain Python requests.
 
 Run:
-  python3 build_state_datasets_v1.py
+  python3 build_state_datasets.py
 ─────────────────────────────────────────────────────────────────────────────
 """
 
@@ -30,9 +30,10 @@ import calendar
 import logging
 import os
 import random
+import re
 import sys
 import time
-from io import StringIO
+from io import BytesIO, StringIO
 from pathlib import Path
 
 import pandas as pd
@@ -67,6 +68,9 @@ STATES_FILE = SCRIPT_DIR / "List of States.xlsx"
 FRED_API_KEY = os.environ.get("FRED_API_KEY", None)
 FRED_CACHE_DIR = OUTPUT_DIR / ".fred_cache"
 FRED_CACHE_DIR.mkdir(exist_ok=True)
+
+BLS_LANRDERR_URL = "https://www.bls.gov/web/laus/lanrderr.xlsx"
+BLS_LANRDERR_CACHE = FRED_CACHE_DIR / "lanrderr.xlsx"
 
 # Only AR and IL publish quarterly {ABBR}OPCI on FRED; others use OTOT/POP.
 OPCI_STATES = frozenset({"AR", "IL"})
@@ -234,6 +238,69 @@ def finalize_quarterly(df: pd.DataFrame, value_col: str) -> pd.DataFrame:
     if out[value_col].isna().any():
         pass  # keep blanks per requirements
     return out
+
+
+def parse_ci_half_width(ci) -> float | None:
+    """Parse BLS 'low – high' 90% confidence interval text to half-width (pp)."""
+    if ci is None or (isinstance(ci, float) and pd.isna(ci)):
+        return None
+    text = str(ci).strip()
+    match = re.match(r"([\d.]+)\s*[–\-]\s*([\d.]+)", text)
+    if not match:
+        return None
+    low, high = float(match.group(1)), float(match.group(2))
+    return (high - low) / 2
+
+
+def fetch_bls_unemployment_rate_moe(session: FetcherSession) -> pd.DataFrame:
+    """
+    Latest BLS LAUS model-based 90% confidence interval half-width by state.
+
+    Source: lanrderr.xlsx (current release month). Used as reference to scale
+    margin of error across the historical panel (see attach_scaled_unemployment_moe).
+    """
+    import openpyxl
+
+    if BLS_LANRDERR_CACHE.exists():
+        wb = openpyxl.load_workbook(BLS_LANRDERR_CACHE, data_only=True)
+    else:
+        resp = session.get(BLS_LANRDERR_URL, timeout=30)
+        BLS_LANRDERR_CACHE.write_bytes(resp.body)
+        wb = openpyxl.load_workbook(BytesIO(resp.body), data_only=True)
+
+    ws = wb.active
+    name_to_abbr = {v: k for k, v in STATE_MAP.items()}
+    rows: list[dict] = []
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if not row or row[0] not in name_to_abbr:
+            continue
+        abbr = name_to_abbr[row[0]]
+        if abbr not in TARGET_ABBRS:
+            continue
+        rate, ci = row[1], row[2]
+        half = parse_ci_half_width(ci)
+        if half is None or rate is None or float(rate) == 0:
+            continue
+        rows.append({"state_abbr": abbr, "ref_rate": float(rate), "ref_moe": half})
+    wb.close()
+
+    if len(rows) < len(TARGET_ABBRS):
+        log(
+            f"  WARNING: BLS unemployment MOE matched {len(rows)}/"
+            f"{len(TARGET_ABBRS)} target states"
+        )
+    return pd.DataFrame(rows)
+
+
+def attach_scaled_unemployment_moe(
+    df: pd.DataFrame,
+    rate_col: str,
+    moe_ref: pd.DataFrame,
+) -> pd.DataFrame:
+    """Scale latest BLS 90% MOE to each row's unemployment rate (percentage points)."""
+    out = df.merge(moe_ref, on="state_abbr", how="left")
+    out["margin_of_error"] = out[rate_col] * (out["ref_moe"] / out["ref_rate"])
+    return out.drop(columns=["ref_rate", "ref_moe"])
 
 
 def finalize_monthly(df: pd.DataFrame, value_col: str) -> pd.DataFrame:
@@ -447,6 +514,7 @@ def build_real_gdp_per_capita(
         ]
     ].copy()
     out = finalize_quarterly(out, "real_gdp_per_capita")
+    out["margin_of_error"] = pd.NA
     out = out[
         [
             "state",
@@ -455,6 +523,7 @@ def build_real_gdp_per_capita(
             "quarter",
             "date",
             "real_gdp_per_capita",
+            "margin_of_error",
             "real_gdp_millions_chained_2017_dollars",
             "population",
         ]
@@ -536,7 +605,19 @@ def build_personal_income_per_capita(
     out = raw[
         ["state", "state_abbr", "year", "quarter", "personal_income_per_capita"]
     ].copy()
-    return finalize_quarterly(out, "personal_income_per_capita")
+    out = finalize_quarterly(out, "personal_income_per_capita")
+    out["margin_of_error"] = pd.NA
+    return out[
+        [
+            "state",
+            "state_abbr",
+            "year",
+            "quarter",
+            "date",
+            "personal_income_per_capita",
+            "margin_of_error",
+        ]
+    ]
 
 
 def build_unemployment(session: FetcherSession) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
@@ -572,6 +653,9 @@ def build_unemployment(session: FetcherSession) -> tuple[pd.DataFrame, pd.DataFr
     if not all_monthly:
         raise RuntimeError("No unemployment data downloaded.")
 
+    moe_ref = fetch_bls_unemployment_rate_moe(session)
+    log(f"  BLS unemployment MOE reference: {len(moe_ref)} states (lanrderr.xlsx)")
+
     monthly = pd.concat(all_monthly, ignore_index=True)
     monthly["year"] = monthly["date"].dt.year
     monthly["month"] = monthly["date"].dt.month
@@ -582,6 +666,8 @@ def build_unemployment(session: FetcherSession) -> tuple[pd.DataFrame, pd.DataFr
         monthly[["state", "state_abbr", "year", "month", "unemployment_rate"]],
         "unemployment_rate",
     )
+    monthly = attach_scaled_unemployment_moe(monthly, "unemployment_rate", moe_ref)
+    monthly["margin_of_error"] = monthly["margin_of_error"].round(4)
     log(
         f"  Monthly panel: {len(monthly)} rows "
         f"({monthly['state_abbr'].nunique()} states × "
@@ -594,10 +680,11 @@ def build_unemployment(session: FetcherSession) -> tuple[pd.DataFrame, pd.DataFr
     panel_monthly = monthly.copy()
     panel_monthly["quarter"] = panel_monthly["month"].apply(lambda m: (m - 1) // 3 + 1)
     quarterly = (
-        panel_monthly.groupby(["state", "state_abbr", "year", "quarter"], as_index=False)[
-            "unemployment_rate"
-        ]
-        .mean()
+        panel_monthly.groupby(["state", "state_abbr", "year", "quarter"], as_index=False)
+        .agg(
+            unemployment_rate=("unemployment_rate", "mean"),
+            margin_of_error=("margin_of_error", "mean"),
+        )
         .round(4)
     )
     month_counts = (
@@ -612,7 +699,7 @@ def build_unemployment(session: FetcherSession) -> tuple[pd.DataFrame, pd.DataFr
     quarterly = quarterly[quarterly["n_months"] == 3].drop(columns=["n_months"])
 
     quarterly_out = quarterly[
-        ["state", "state_abbr", "year", "quarter", "unemployment_rate"]
+        ["state", "state_abbr", "year", "quarter", "unemployment_rate", "margin_of_error"]
     ].copy()
     quarterly_out = finalize_quarterly(quarterly_out, "unemployment_rate")
 
@@ -647,7 +734,7 @@ def build_homeownership() -> pd.DataFrame:
         lambda r: quarter_end_date(int(r["year"]), int(r["quarter"])), axis=1
     )
     out = home[
-        ["state", "state_abbr", "year", "quarter", "date", "homeownership_rate"]
+        ["state", "state_abbr", "year", "quarter", "date", "homeownership_rate", "margin_of_error"]
     ].sort_values(["state_abbr", "year", "quarter"])
     out = out.drop_duplicates(subset=["state_abbr", "date"], keep="last").reset_index(drop=True)
     print(f"  ✓  {len(out)} rows, {out['state_abbr'].nunique()} states, "
@@ -670,7 +757,9 @@ def build_source_notes() -> pd.DataFrame:
                 "Real GDP in millions of chained 2017 dollars divided by annual "
                 "population (thousands × 1000 from FRED POP). Annual population "
                 "is merged to all quarters in the same year; latest available "
-                "population is forward-filled within each state when missing."
+                "population is forward-filled within each state when missing. "
+                "margin_of_error: BEA does not publish sampling margins of error "
+                "for state GDP; column is blank."
             ),
         },
         {
@@ -686,7 +775,9 @@ def build_source_notes() -> pd.DataFrame:
                 "Other states: quarterly total personal income ({ABBR}OTOT, "
                 "millions of dollars SAAR) divided by annual population "
                 "({ABBR}POP thousands × 1000), with population forward-filled "
-                "within each state when missing."
+                "within each state when missing. "
+                "margin_of_error: BEA does not publish sampling margins of error "
+                "for state personal income; column is blank."
             ),
         },
         {
@@ -701,7 +792,10 @@ def build_source_notes() -> pd.DataFrame:
                 "Statewide unemployment rate via Scrapling/FRED CSV ({ABBR}UR). "
                 "2025M10 was blank in the FRED download for all 27 states; "
                 "values were linearly interpolated from adjacent months "
-                "(September and November 2025)."
+                "(September and November 2025). "
+                "margin_of_error: 90% confidence interval half-width from BLS "
+                "lanrderr.xlsx (latest LAUS release), scaled to each month's "
+                "rate as rate × (ref_moe / ref_rate); units are percentage points."
             ),
         },
         {
@@ -715,7 +809,9 @@ def build_source_notes() -> pd.DataFrame:
             "notes": (
                 "Arithmetic mean of three monthly unemployment rates; "
                 "complete quarters only. Includes 2025Q4 using interpolated "
-                "2025M10 (see monthly unemployment notes)."
+                "2025M10 (see monthly unemployment notes). "
+                "margin_of_error: mean of the three monthly margins of error "
+                "in each quarter (percentage points)."
             ),
         },
         {
@@ -728,7 +824,9 @@ def build_source_notes() -> pd.DataFrame:
             "output_file": "homeownership_rate_by_state.csv",
             "notes": (
                 f"Parsed from local file {HOMEOWNERSHIP_FILE.name}; "
-                "2026Q1 excluded from final panel for consistency."
+                "2026Q1 excluded from final panel for consistency. "
+                "margin_of_error: Census HVS Table 3 published margin of error "
+                "(percentage points, 90% confidence level)."
             ),
         },
     ]
@@ -806,16 +904,19 @@ DATA_FILE_SPECS: dict[str, dict] = {
             "quarter",
             "date",
             "real_gdp_per_capita",
+            "margin_of_error",
             "real_gdp_millions_chained_2017_dollars",
             "population",
         ],
         "optional_columns": [
             "real_gdp_millions_chained_2017_dollars",
             "population",
+            "margin_of_error",
         ],
         "value_col": "real_gdp_per_capita",
         "numeric_cols": [
             "real_gdp_per_capita",
+            "margin_of_error",
             "real_gdp_millions_chained_2017_dollars",
             "population",
         ],
@@ -831,10 +932,11 @@ DATA_FILE_SPECS: dict[str, dict] = {
             "quarter",
             "date",
             "personal_income_per_capita",
+            "margin_of_error",
         ],
-        "optional_columns": [],
+        "optional_columns": ["margin_of_error"],
         "value_col": "personal_income_per_capita",
-        "numeric_cols": ["personal_income_per_capita"],
+        "numeric_cols": ["personal_income_per_capita", "margin_of_error"],
         "is_monthly": False,
         "expected_rows": 1728,
         "sort_cols": ["state_abbr", "year", "quarter"],
@@ -847,10 +949,11 @@ DATA_FILE_SPECS: dict[str, dict] = {
             "month",
             "date",
             "unemployment_rate",
+            "margin_of_error",
         ],
         "optional_columns": [],
         "value_col": "unemployment_rate",
-        "numeric_cols": ["unemployment_rate"],
+        "numeric_cols": ["unemployment_rate", "margin_of_error"],
         "is_monthly": True,
         "expected_rows": 5184,
         "sort_cols": ["state_abbr", "year", "month"],
@@ -863,10 +966,11 @@ DATA_FILE_SPECS: dict[str, dict] = {
             "quarter",
             "date",
             "unemployment_rate",
+            "margin_of_error",
         ],
         "optional_columns": [],
         "value_col": "unemployment_rate",
-        "numeric_cols": ["unemployment_rate"],
+        "numeric_cols": ["unemployment_rate", "margin_of_error"],
         "is_monthly": False,
         "expected_rows": 1728,
         "sort_cols": ["state_abbr", "year", "quarter"],
@@ -879,10 +983,11 @@ DATA_FILE_SPECS: dict[str, dict] = {
             "quarter",
             "date",
             "homeownership_rate",
+            "margin_of_error",
         ],
         "optional_columns": [],
         "value_col": "homeownership_rate",
-        "numeric_cols": ["homeownership_rate"],
+        "numeric_cols": ["homeownership_rate", "margin_of_error"],
         "is_monthly": False,
         "expected_rows": 1728,
         "sort_cols": ["state_abbr", "year", "quarter"],

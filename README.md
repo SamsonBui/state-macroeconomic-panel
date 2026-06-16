@@ -1,6 +1,6 @@
 # State Economic Data Pipeline
 
-This folder documents how `build_state_datasets_v1.py` builds state-level economic datasets, writes raw assembled files to `output/`, and produces professor-ready cleaned files in `cleaned_output/`.
+This folder documents how `build_state_datasets.py` builds state-level economic datasets, writes raw assembled files to `output/`, and produces cleaned files in `cleaned_output/`.
 
 ## Quick start
 
@@ -26,12 +26,12 @@ python3 -c "from build_state_datasets import run_cleanup_step; run_cleanup_step(
 
 ```
 GDP/
-├── build_state_datasets_v1.py   # Main script
+├── build_state_datasets.py      # Main script
 ├── tab3_state05_2026_hmr.xlsx   # Census homeownership source (local)
 ├── List of States.xlsx          # State filter list (homeownership parser)
 ├── output/                      # Raw assembled CSVs from the build step
 │   ├── *.csv
-│   └── .fred_cache/             # Cached FRED CSV downloads (not cleaned)
+│   └── .fred_cache/             # Cached FRED/BLS downloads (not cleaned)
 ├── cleaned_output/              # Standardized, submission-ready CSVs
 │   └── *.csv
 └── docs/
@@ -67,7 +67,7 @@ GDP/
 
 ---
 
-## How `build_state_datasets_v1.py` works
+## How `build_state_datasets.py` works
 
 The script has three major phases: **fetch & build**, **save to `output/`**, and **cleanup to `cleaned_output/`**.
 
@@ -76,6 +76,7 @@ flowchart TD
     subgraph inputs [Inputs]
         FRED[FRED via Scrapling]
         XLSX[Census HVS Excel]
+        BLS[BLS lanrderr.xlsx]
     end
 
     subgraph build [Build step]
@@ -90,6 +91,7 @@ flowchart TD
         FRED --> GDP
         FRED --> PI
         FRED --> UR
+        BLS --> UR
         XLSX --> HMR
     end
 
@@ -121,7 +123,7 @@ Plain Python `requests` often times out or gets blocked by FRED’s Akamai prote
 https://fred.stlouisfed.org/graph/fredgraph.csv?id={SERIES}&cosd=2010-01-01
 ```
 
-Successful downloads are cached under `output/.fred_cache/{SERIES}.csv` so reruns are fast.
+Successful FRED downloads are cached under `output/.fred_cache/{SERIES}.csv`. BLS unemployment MOE reference file `lanrderr.xlsx` is cached at `output/.fred_cache/lanrderr.xlsx`. Reruns are fast when cache hits.
 
 Optional: set `FRED_API_KEY` for API fallback on failed CSV downloads. Set `FRED_PAUSE=0` to disable pacing between requests.
 
@@ -161,14 +163,37 @@ Used as the denominator for real GDP per capita and for personal income where OP
 
 **October 2025 note:** FRED returns a blank value for 2025M10 for all 27 states. The script fills that gap by **linear interpolation** between September and November 2025 so the panel stays complete and 2025Q4 can be computed.
 
+**Margin of error (unemployment):** After rates are assembled, the script downloads BLS [Regional and State Employment and Unemployment — Model-based Error](https://www.bls.gov/web/laus/lanrderr.xlsx) (`lanrderr.xlsx`). For each state it parses the published **90% confidence interval** (e.g. `3.6 – 4.9`) and takes the half-width in percentage points. That reference MOE is scaled to each month’s rate:
+
+```
+margin_of_error = unemployment_rate × (ref_moe / ref_rate)
+```
+
+Quarterly unemployment MOE is the **mean of the three monthly MOEs** in each quarter (matching the arithmetic mean used for the quarterly rate). BLS publishes MOE for the latest release month only; the scaled value is applied across the 2010–2025 panel.
+
 #### 5. Homeownership (`build_homeownership`)
 
 - **No API** — parses local Census HVS file `tab3_state05_2026_hmr.xlsx`
 - Uses `filter_homeownership_to_tidy.parse_homeownership()`
 - Quarterly homeownership rate (%), not seasonally adjusted
+- **Margin of error:** Census-published MOE from Table 3 (90% confidence level, percentage points), parsed alongside each rate
 - 2026Q1 from the source file is excluded; panel ends at 2025Q4
 
-#### 6. Metadata
+#### 6. Margin of error across datasets
+
+Every data file in `cleaned_output/` includes a `margin_of_error` column after the main value column. Units are **percentage points** for rate series.
+
+| Dataset | MOE populated? | Source / method |
+|---------|----------------|-----------------|
+| `homeownership_rate_by_state.csv` | Yes (all rows) | Census HVS Table 3 published MOE |
+| `monthly_unemployment_rate_by_state.csv` | Yes (all rows) | BLS `lanrderr.xlsx` 90% CI half-width, scaled to each month’s rate |
+| `unemployment_rate_by_state.csv` | Yes (all rows) | Mean of three monthly MOEs in each quarter |
+| `real_gdp_per_capita_by_state.csv` | No (blank) | BEA does not publish sampling margins of error for state GDP |
+| `personal_income_per_capita_by_state.csv` | No (blank) | BEA does not publish sampling margins of error for state personal income |
+
+See `source_notes.csv` for per-variable MOE notes. Blank MOE cells are intentional for BEA series, not missing data in the primary estimate.
+
+#### 7. Metadata
 
 - `source_notes.csv` — documentation of each variable’s source, units, and method
 - `data_quality_report.csv` — row counts, date ranges, missing values, duplicates (for `output/`)
@@ -227,13 +252,14 @@ A file gets **`status = ok`** in the quality report only if it has all 27 states
 | `quarter` | Quarter (1–4) |
 | `date` | Quarter-end date (`YYYY-MM-DD`) |
 | `real_gdp_per_capita` | Real GDP per person (chained 2017 dollars) |
+| `margin_of_error` | Blank — BEA does not publish MOE for state GDP |
 | `real_gdp_millions_chained_2017_dollars` | Numerator: state real GDP (millions, SAAR) |
 | `population` | Denominator: annual population (persons) |
 
 **Example row (Arkansas, 2010Q1):**
 
 ```
-Arkansas,AR,2010,1,2010-03-31,37711.94,110194.2,2921998.0
+Arkansas,AR,2010,1,2010-03-31,37711.94,,110194.2,2921998.0
 ```
 
 ---
@@ -257,6 +283,7 @@ Arkansas,AR,2010,1,2010-03-31,37711.94,110194.2,2921998.0
 | `quarter` | Quarter (1–4) |
 | `date` | Quarter-end date |
 | `personal_income_per_capita` | Personal income per person (current dollars, SAAR) |
+| `margin_of_error` | Blank — BEA does not publish MOE for state personal income |
 
 AR and IL use direct OPCI; all other states use OTOT ÷ population.
 
@@ -281,6 +308,7 @@ AR and IL use direct OPCI; all other states use OTOT ÷ population.
 | `month` | Month (1–12) |
 | `date` | Month-end date |
 | `unemployment_rate` | Unemployment rate (percent, seasonally adjusted) |
+| `margin_of_error` | Approximate 90% MOE (percentage points), scaled from BLS `lanrderr.xlsx` |
 
 2025M10 values were interpolated where FRED published a blank.
 
@@ -305,6 +333,7 @@ AR and IL use direct OPCI; all other states use OTOT ÷ population.
 | `quarter` | Quarter (1–4) |
 | `date` | Quarter-end date |
 | `unemployment_rate` | Mean of three monthly unemployment rates in the quarter |
+| `margin_of_error` | Mean of three monthly MOEs in the quarter (percentage points) |
 
 Only **complete quarters** (three months present) are included. Includes 2025Q4 using interpolated October 2025.
 
@@ -329,6 +358,13 @@ Only **complete quarters** (three months present) are included. Includes 2025Q4 
 | `quarter` | Quarter (1–4) |
 | `date` | Quarter-end date |
 | `homeownership_rate` | Homeownership rate (% of occupied units, not seasonally adjusted) |
+| `margin_of_error` | Census HVS published MOE (90% confidence, percentage points) |
+
+**Example row (Arkansas, 2010Q1):**
+
+```
+Arkansas,AR,2010,1,2010-03-31,69.2,3.3
+```
 
 ---
 
@@ -336,7 +372,7 @@ Only **complete quarters** (three months present) are included. Includes 2025Q4 
 
 #### `source_notes.csv`
 
-One row per variable. Documents where each dataset came from, frequency, seasonal adjustment, units, date range, output filename, and methodological notes (including OPCI fallback, unemployment interpolation, etc.).
+One row per variable. Documents where each dataset came from, frequency, seasonal adjustment, units, date range, output filename, and methodological notes (including OPCI fallback, unemployment interpolation, and margin-of-error methodology).
 
 **Columns:** `variable`, `source`, `frequency`, `seasonal_adjustment`, `units`, `date_range`, `output_file`, `notes`
 
@@ -379,7 +415,7 @@ All cleaned files share a consistent long format:
 
 - Identifiers: `state`, `state_abbr`
 - Time: `year` + (`quarter` or `month`) + `date`
-- One numeric outcome column per file
+- One numeric outcome column per file, plus `margin_of_error` where applicable
 
 **Stata example:**
 
