@@ -445,7 +445,7 @@ gdp$date <- as.Date(gdp$date)
 | **Quality report** | Built from raw files | Regenerated after cleaning |
 | **Overwritten by cleanup?** | No | Yes (files inside folder only) |
 
-Both folders contain the same seven filenames; **`cleaned_output/` is the version to share with your professor.**
+Both folders contain the same seven filenames.
 
 ---
 
