@@ -1,0 +1,6 @@
+file,rows,unique_states,min_date,max_date,missing_values,duplicate_state_date_rows,all_27_states_present,missing_states,extra_states,expected_rows,row_count_matches_expected,status,notes
+real_gdp_per_capita_by_state.csv,2700,27,2001-03-31,2025-12-31,0,0,True,,,2700,True,ok,
+personal_income_per_capita_by_state.csv,2700,27,2001-03-31,2025-12-31,0,0,True,,,2700,True,ok,
+monthly_unemployment_rate_by_state.csv,8100,27,2001-01-31,2025-12-31,0,0,True,,,8100,True,ok,
+unemployment_rate_by_state.csv,2700,27,2001-03-31,2025-12-31,0,0,True,,,2700,True,ok,
+homeownership_rate_by_state.csv,2700,27,2001-03-31,2025-12-31,0,0,True,,,2700,True,ok,

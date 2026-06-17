@@ -6,7 +6,7 @@ The script supports three panel configurations: the original **2010–2025** pan
 
 ## Quick start
 
-From this repository root:
+From the `GDP/` directory:
 
 ```bash
 # Default: build 2010 panel + extended 2001 panel
@@ -37,7 +37,7 @@ python3 -c "from build_state_datasets import run_cleanup_step, PANEL_2001_FULL; 
 ## Folder layout
 
 ```
-.
+GDP/
 ├── build_state_datasets.py           # Main script
 ├── filter_homeownership_to_tidy.py   # Census homeownership parser
 ├── tab3_state05_2026_hmr.xlsx        # Census HVS quarterly Table 3 (local)

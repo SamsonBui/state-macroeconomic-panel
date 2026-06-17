@@ -1,0 +1,6 @@
+.DS_Store
+**/__pycache__/
+**/*.pyc
+**/.fred_cache/
+_moe_tmp/
+SQGDP (1)/
